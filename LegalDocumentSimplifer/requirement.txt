@@ -1,0 +1,5 @@
+transformers
+nltk
+rouge-score
+numpy
+streamlit
