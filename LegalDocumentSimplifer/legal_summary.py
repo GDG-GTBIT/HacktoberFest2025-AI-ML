@@ -1,55 +1,83 @@
-# import torch
-# from transformers import (
-#     BartForConditionalGeneration,
-#     BartTokenizer,
-# )
-# import streamlit as st
-# from rouge_score import rouge_scorer
-# import numpy as np
-# import kagglehub
-
-
-
-# model = BartForConditionalGeneration.from_pretrained('models/billsum')
-# tokenizer = BartTokenizer.from_pretrained('models/billsum')
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# model.to(device)
-
-# model.eval()
-
-# from summarygenerator import generate_summary
-# st.title("Legal Text Summary Generator")
-# text = st.text_area("Enter legal text:", height=100)
-# if st.button("Generate Summary"):
-#     if text.strip():  
-#         summary = generate_summary(text)
-#         st.subheader("Generated Summary")
-#         st.write(summary)
-#     else:
-#         st.warning("Please enter some text to summarize.")
 import torch
 from transformers import (
-    BartForConditionalGeneration,
-    BartTokenizer,
+    pipeline,
+    AutoTokenizer,
+    AutoModelForSequenceClassification
 )
 import streamlit as st
-from rouge_score import rouge_scorer
-import numpy as np
-import kagglehub
 import PyPDF2
-import io
+from difflib import SequenceMatcher
+from sentence_transformers import SentenceTransformer, util
+
+import nltk
+nltk.download('punkt')
+nltk.download('punkt_tab')
+from nltk.tokenize import sent_tokenize
 
 # Load model
 @st.cache_resource
 def load_model():
-    tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
-    model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+    tokenizer = AutoTokenizer.from_pretrained("manueldeprada/FactCC")
+    model = AutoModelForSequenceClassification.from_pretrained("manueldeprada/FactCC")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
     model.to(device)
     model.eval()
-    return model, tokenizer, device
+    return summarizer, model, tokenizer, device, similarity_model
 
-model, tokenizer, device = load_model()
+summarizer, model, tokenizer, device, similarity_model = load_model()
+
+def find_relevant_context(source_text, sentence, window=3):
+    source_sentences = sent_tokenize(source_text)
+    if not source_sentences:
+        return source_text
+
+    best_idx, best_score = 0, 0
+    for i, s in enumerate(source_sentences):
+        score = SequenceMatcher(None, sentence.lower(), s.lower()).ratio()
+        if score > best_score:
+            best_idx, best_score = i, score
+
+    start = max(0, best_idx - window // 2)
+    end = min(len(source_sentences), best_idx + window // 2 + 1)
+    return " ".join(source_sentences[start:end])
+
+def check_factual_consistency(source_text, summary_text, model, tokenizer, device):
+
+    sentences = sent_tokenize(summary_text)
+    labels = ["INCONSISTENT", "CONSISTENT"]
+
+    results = []
+    for sent in sentences:
+        relevant_context = find_relevant_context(source_text, sent)
+
+        inputs = tokenizer(
+            relevant_context,
+            sent,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+            padding=True
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            pred = torch.argmax(outputs.logits, dim=1).item()
+            label = labels[pred]
+
+        emb1 = similarity_model.encode(relevant_context, convert_to_tensor=True)
+        emb2 = similarity_model.encode(sent, convert_to_tensor=True)
+        sim = float(util.cos_sim(emb1, emb2))
+
+        if label == "INCONSISTENT" and sim > 0.8:
+            label = "LIKELY CONSISTENT"
+
+        results.append((sent, label, round(sim, 3)))
+
+    return results
+
 
 def generate_summary(text, max_length=150, min_length=50):
     """Generate a summary for the given text using the BART model."""
@@ -58,17 +86,9 @@ def generate_summary(text, max_length=150, min_length=50):
     
     # Generate summary
     with torch.no_grad():
-        summary_ids = model.generate(
-            inputs["input_ids"],
-            max_length=max_length,
-            min_length=min_length,
-            num_beams=4,
-            early_stopping=True,
-        )
-    
-    # Decode summary
-    summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    return summary
+        summary = summarizer(text, max_length=max_length, min_length=min_length, do_sample=False)
+
+    return summary[0]['summary_text']
 
 def extract_text_from_pdf(pdf_file):
     """Extract text from a PDF file."""
@@ -93,6 +113,19 @@ with tab1:
             summary = generate_summary(text_input)
             st.subheader("Generated Summary")
             st.write(summary)
+
+            with st.spinner("Checking factual consistency..."):
+                fact_results = check_factual_consistency(text_input, summary, model, tokenizer, device)
+
+            st.subheader("Fact Consistency Results")
+            for sent, label, points in fact_results:
+                if label == "LIKELY CONSISTENT":
+                    color = "🟡"
+                elif label == "INCONSISTENT":
+                    color = "🔴"
+                else:
+                    color = "🟢"
+                st.markdown(f"{color} **{label}**: {sent}")
     elif generate_button:
         st.warning("Please enter some text to summarize.")
 
