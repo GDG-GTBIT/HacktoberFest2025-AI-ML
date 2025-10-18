@@ -3,3 +3,6 @@ nltk
 rouge-score
 numpy
 streamlit
+torch
+PyPDF2
+kagglehub
